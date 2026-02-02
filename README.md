@@ -1,6 +1,6 @@
 # Merge Engine - Standalone GPU-Accelerated Data Pipeline
 
-## Version: 27.00 | ALGO 95.4 Compliant
+## Version: 28.00 | ALGO 95.66 Compliant | Season Lock Enabled
 
 ---
 
@@ -10,10 +10,11 @@ The Merge Engine merges FlixPatrol views data into the BFD master database using
 
 ### Key Features
 
-- **GPU MANDATORY** - No CPU fallback (ALGO 95.4 compliance)
+- **GPU MANDATORY** - No CPU fallback (ALGO 95.66 compliance)
 - **FlixPatrol Senior Credibility** - OVERWRITES existing views data
 - **VBUS Memory Management** - Prevents GPU drowning (VRAM as L1 cache)
 - **Intelligent View Allocation** - Direct mapping is SENIOR, season allocation only when needed
+- **SEASON LOCK** - Hardware lock preventing views on invalid (imdb_id, season) combinations
 
 ---
 
@@ -22,9 +23,11 @@ The Merge Engine merges FlixPatrol views data into the BFD master database using
 | File | Purpose |
 |------|---------|
 | `intelligent_merge_engine_v27_gpu.py` | **MAIN** - GPU-accelerated merge engine |
+| `season_lock.py` | **NEW** - Hardware lock for (imdb_id, season) validation |
 | `vbus_memory_manager.py` | VBUS hierarchical cache (L1/L2/L3) for GPU memory |
 | `season_allocator.py` | ALGO2 season allocation engine |
 | `run_gpu.sh` | GPU runner script (use in WSL) |
+| `test_season_lock_integration.py` | Test script for Season Lock integration |
 
 ---
 
@@ -102,6 +105,48 @@ Prevents GPU "drowning" by staging data across memory tiers:
 
 ---
 
+## Season Lock (Hardware Validation)
+
+Prevents data corruption by validating (imdb_id, season_number) combinations BEFORE views are merged.
+
+### Why This Matters
+
+```
+WITHOUT LOCK:
+  Netflix says: "The Witcher: Season 5" (typo - doesn't exist)
+  Merge creates: fc_uid = tt0898266_s05 → DATA CORRUPTION
+
+WITH LOCK:
+  Netflix says: "The Witcher: Season 5"
+  Lock validates: (tt0898266, 5) NOT in reference → REJECTED → DATA PROTECTED
+```
+
+### How It Works
+
+1. **Build Lock Table**: Loads IMDB (224K+) and FlixPatrol (27K) reference data
+2. **Create Valid Set**: Only combinations that exist in reference are valid
+3. **Validate Before Merge**: Every row checked against lock table
+4. **Reject Invalid**: Data not in lock table is REJECTED
+
+### Validation Rules
+
+| Rule | Behavior |
+|------|----------|
+| Films | No season allowed (always NULL) |
+| TV Shows | Must match (imdb_id, season) in lock table |
+| Season > max_seasons | REJECTED |
+| Unknown IMDB | Allowed with warning (new titles) |
+
+### Test the Integration
+
+```bash
+# From Windows:
+cd "C:\Users\RoyT6\Downloads\Merge Engine"
+python test_season_lock_integration.py
+```
+
+---
+
 ## Dependencies
 
 ### Required (via RAPIDS)
@@ -153,5 +198,5 @@ Only 3 FlixPatrol columns allowed:
 
 ---
 
-**Last Updated**: 2026-01-23
-**Engine Version**: V27.00 (Standalone)
+**Last Updated**: 2026-01-31
+**Engine Version**: V28.00 (Standalone + Season Lock)

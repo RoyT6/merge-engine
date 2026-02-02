@@ -297,5 +297,117 @@ If BFD_VIEWS needs rebuilding, use: `Cloudflare/data/BFD_V22.02.parquet` (765,86
 
 ---
 
-**Last Updated**: 2026-01-28
-**Version**: Standalone V27.00
+## SESSION LOG: 2026-01-31 - Season Lock Integration
+
+### Problem Solved
+
+**Data Corruption Risk:** Views could be assigned to invalid (imdb_id, season_number) combinations.
+
+Example:
+```
+Netflix says: "The Witcher: Season 5" (doesn't exist - typo or error)
+WITHOUT LOCK: fc_uid = tt0898266_s05 created → DATA CORRUPTION
+WITH LOCK: Lock validation fails → REJECTED → DATA PROTECTED
+```
+
+### Solution: Hardware Lock Integration
+
+Integrated **Season Lock** from Master Ingestion Engine ("This AI") into Merge Engine.
+
+**What it does:**
+1. Builds lock table from IMDB (224K+) and FlixPatrol (27K) reference data
+2. ONLY allows views to be assigned to pre-validated (imdb_id, season) combinations
+3. REJECTS any data that doesn't exist in lock table
+
+### Files Added/Modified
+
+| File | Action | Description |
+|------|--------|-------------|
+| `season_lock.py` | ADDED | Hardware lock module (GPU-accelerated) |
+| `intelligent_merge_engine_v27_gpu.py` | MODIFIED | Integrated Season Lock validation |
+
+### Code Changes to Merge Engine
+
+1. **Import Season Lock:**
+```python
+from season_lock import SeasonLock, create_season_lock
+```
+
+2. **Initialize in __init__:**
+```python
+self.season_lock = SeasonLock()
+```
+
+3. **Build from reference after loading BFD:**
+```python
+self.build_season_lock()
+# Loads IMDB + FlixPatrol reference
+# Creates valid (imdb_id, season) combinations
+```
+
+4. **Validate BEFORE merge:**
+```python
+is_valid, fc_uid, reason = self._validate_season_lock(imdb_id, season, title)
+if not is_valid:
+    skipped_season_lock += 1
+    continue  # REJECT - do not merge
+```
+
+### New Stats Tracked
+
+| Stat | Description |
+|------|-------------|
+| `rows_skipped_season_lock` | Rows rejected by Season Lock |
+| `season_lock.validations_passed` | Valid combinations found |
+| `season_lock.validations_failed` | Invalid combinations rejected |
+| `season_lock.rejections` | List of rejection reasons |
+
+### Reference Data Used
+
+| Source | Records | Purpose |
+|--------|---------|---------|
+| IMDB Seasons Allocated Correct.csv | 224K+ | TV season combinations |
+| FlixPatrol Views Season Allocated.csv | 27K | Additional TV records |
+
+### Validation Rules
+
+1. **Films:** No season allowed (always NULL)
+2. **TV Shows:** Must match (imdb_id, season) in lock table
+3. **Unknown IMDB:** Allowed with warning (new titles)
+4. **Season > max_seasons:** REJECTED
+
+### Run Command (Unchanged)
+
+```bash
+# WSL execution
+cd "/mnt/c/Users/RoyT6/Downloads/Merge Engine"
+./run_gpu.sh
+```
+
+### Expected Output with Season Lock
+
+```
+[GPU] cuDF 24.12.00 loaded
+[VBUS] Memory manager loaded (standalone)
+[LOCK] Season Lock module loaded (hardware lock for season validation)
+...
+[LOCK] Building Season Lock from reference data...
+[LOCK] IMDB loaded: 224,385 rows
+[LOCK] FlixPatrol loaded: 27,418 rows
+[LOCK] Lock table built in 3.2s
+[LOCK] Valid combinations: 251,803
+[LOCK] TV shows: 224,385
+[LOCK] Films: 0
+...
+[RESULT] Skipped (Season Lock rejected): 1,234
+...
+Season Lock (Hardware Validation):
+  Validations passed: 62,098
+  Validations failed: 1,234
+  Total locks: 251,803
+```
+
+---
+
+**Last Updated**: 2026-01-31
+**Version**: Standalone V28.00 + Season Lock

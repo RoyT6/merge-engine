@@ -1,11 +1,12 @@
 """
 Intelligent Merge Engine for BFD V28.00 - GPU Accelerated + VBUS Memory Management
 ==================================================================================
-STANDALONE VERSION - Schema V28 Compliant
+STANDALONE VERSION - Schema V28 Compliant + SEASON LOCK INTEGRATED
 
 V28.00 ADDITIONS:
 - star_1, star_2, star_3, supporting_cast columns for major actor differentiation
 - cast_data preserved for backwards compatibility but DEPRECATED
+- SEASON LOCK: Hardware lock preventing views on invalid (imdb_id, season) combinations
 
 CRITICAL RULES:
 1. NO NEW COLUMNS WITHOUT AUTHORIZATION - Engine MUST ask before creating any column
@@ -16,6 +17,9 @@ CRITICAL RULES:
    - See: Schema/RULES/pre_premiere_views_rules.json
    - Bug Fixed: 68.7M impossible views cells nulled
    - MUST validate: IF period_end_date < premiere_date THEN value = NULL
+6. SEASON LOCK: Views can ONLY be assigned to pre-validated (imdb_id, season) combinations
+   - If combination not in lock table -> REJECTED
+   - Prevents: "The Witcher Season 5" (doesn't exist) from corrupting data
 
 FlixPatrol has SENIOR CREDIBILITY - overwrites existing views data.
 Appends NEW rows when FlixPatrol has titles not in BFD.
@@ -82,20 +86,30 @@ except ImportError:
     SEASON_ALLOCATOR_AVAILABLE = False
     print("[ALGO2] Season allocator not available")
 
+# Import Season Lock - HARDWARE LOCK for valid (imdb_id, season) combinations
+try:
+    from season_lock import SeasonLock, create_season_lock
+    SEASON_LOCK_AVAILABLE = True
+    print("[LOCK] Season Lock module loaded (hardware lock for season validation)")
+except ImportError:
+    SEASON_LOCK_AVAILABLE = False
+    SeasonLock = None
+    print("[LOCK] Season Lock not available - validation disabled")
+
 # Use WSL paths
 BASE_DIR = Path("/mnt/c/Users/RoyT6/Downloads")
 WEIGHTERS_DIR = BASE_DIR / "Weighters"
-SCHEMA_PATH = BASE_DIR / "Schema" / "SCHEMA_V27.00.json"
+SCHEMA_PATH = BASE_DIR / "Schema Engine" / "Others" / "SCHEMA_V27.66.json"
 
 # Input files
-BFD_BASE = BASE_DIR / "BFD_V27.54.parquet"  # V27.54 master database
-FLIXPATROL_VIEWS = BASE_DIR / "ToMerge" / "FlixPatrol_Views_v40.10_CLEANED.csv"
-FLIXPATROL_MULTI_TEMPORAL = BASE_DIR / "ToMerge" / "FlixPatrol_Multi_Temporal_v41.00_CLEANED.csv"
-FLIXPATROL_NETFLIX = BASE_DIR / "ToMerge" / "FlixPatrol_Netflix_Weekly_Views_v40.10_CLEANED.csv"
+BFD_BASE = BASE_DIR / "BFD_VIEWS_V28.001.parquet"  # V28.00 master database
+FLIXPATROL_VIEWS = BASE_DIR / "Training Data" / "FlixPatrol" / "FlixPatrol_Views_v40.10.csv"
+FLIXPATROL_MULTI_TEMPORAL = BASE_DIR / "Training Data" / "Red Hair" / "FlixPatrol_Multi_Temporal_v41.00_CLEANED.csv"
+FLIXPATROL_NETFLIX = BASE_DIR / "Training Data" / "FlixPatrol" / "FlixPatrol All Views Jan 25.csv"
 
 # Output
-OUTPUT_FILE = BASE_DIR / "BFD_V27.55.parquet"
-REPORT_FILE = BASE_DIR / "BFD_V27.55.merge_report.json"
+OUTPUT_FILE = BASE_DIR / "BFD_VIEWS_V28.02.parquet"
+REPORT_FILE = BASE_DIR / "BFD_VIEWS_V28.02.merge_report.json"
 
 # Empty value handling
 EMPTY_VALUES = {'', 'None', 'none', 'nan', 'NaN', 'NULL', 'null', 'N/A', 'n/a', '<NA>'}
@@ -160,12 +174,18 @@ class GPUMergeEngine:
             'values_overwritten': 0,
             'rows_skipped_forbidden_temporal': 0,
             'rows_skipped_no_column_match': 0,
+            'rows_skipped_season_lock': 0,  # NEW: Season Lock rejections
             'columns_requested_but_denied': [],
             'final_rows': 0,
             'final_columns': 0,
             'grep_performance': {
                 'column_lookups': 0,
                 'grep_cache_hits': 0,
+            },
+            'season_lock': {  # NEW: Season Lock stats
+                'validations_passed': 0,
+                'validations_failed': 0,
+                'rejections': []
             }
         }
         self.bfd = None
@@ -181,6 +201,12 @@ class GPUMergeEngine:
             self.vbus_manager = VBUSGPUManager(use_gpu=True)
             print("[VBUS] GPU Memory Manager initialized")
             print("[GREP] O(1) column lookups enabled via grep engine")
+
+        # Season Lock - HARDWARE LOCK for (imdb_id, season) validation
+        self.season_lock = None
+        if SEASON_LOCK_AVAILABLE:
+            self.season_lock = SeasonLock()
+            print("[LOCK] Season Lock initialized - will build from reference")
 
     def load_schema(self):
         """Load schema and cache valid column names."""
@@ -233,6 +259,53 @@ class GPUMergeEngine:
 
         mem_free, mem_total = cp.cuda.runtime.memGetInfo()
         print(f"[GPU] VRAM after load: {mem_free/1e9:.1f}GB free")
+
+    def build_season_lock(self):
+        """
+        Build Season Lock from reference data.
+
+        CRITICAL: This creates the AUTHORITATIVE list of valid (imdb_id, season)
+        combinations. Any data not in this list will be REJECTED.
+        """
+        if not self.season_lock:
+            print("[LOCK] Season Lock not available - skipping")
+            return
+
+        print("\n[LOCK] Building Season Lock from reference data...")
+
+        # Reference file paths (WSL format)
+        imdb_path = str(BASE_DIR / "Training Data" / "IMDB Ref Files" / "IMDB Seasons Allocated Correct.csv")
+        fp_path = str(BASE_DIR / "Training Data" / "FlixPatrol" / "DO NOT LOSE PRECIOUS FlixPatrol_Views_Season_Allocated.csv")
+
+        try:
+            num_locks = self.season_lock.build_from_reference(imdb_path, fp_path)
+            print(f"[LOCK] Season Lock ready: {num_locks:,} valid combinations")
+            print(f"[LOCK] TV shows: {self.season_lock.stats['tv_titles']:,}")
+            print(f"[LOCK] Films: {self.season_lock.stats['film_titles']:,}")
+        except Exception as e:
+            print(f"[LOCK] Warning: Could not build Season Lock: {e}")
+            print("[LOCK] Merge will continue WITHOUT season validation")
+            self.season_lock = None
+
+    def _validate_season_lock(self, imdb_id: str, season_number, title: str) -> tuple:
+        """
+        Validate (imdb_id, season) against Season Lock.
+
+        Returns: (is_valid, fc_uid, reason)
+        """
+        if not self.season_lock or not self.season_lock.is_initialized():
+            # No lock - allow everything (backwards compatibility)
+            return True, None, "NO_LOCK"
+
+        # Handle NULL/empty season
+        season = None
+        if season_number is not None and str(season_number) not in EMPTY_VALUES:
+            try:
+                season = int(float(season_number))
+            except (ValueError, TypeError):
+                season = None
+
+        return self.season_lock.validate(imdb_id, season, title)
 
     def _validate_temporal_type(self, temporal_type: str, row_info: dict) -> bool:
         """
@@ -377,6 +450,8 @@ class GPUMergeEngine:
         bfd_pandas['imdb_id_norm'] = bfd_pandas['imdb_id'].apply(norm_imdb)
         fp_df['imdb_id_norm'] = fp_df['imdb_id'].apply(norm_imdb)
 
+        skipped_season_lock = 0  # Track Season Lock rejections
+
         for idx, fp_row in fp_df.iterrows():
             processed += 1
 
@@ -397,6 +472,24 @@ class GPUMergeEngine:
             except ForbiddenTemporalTypeError:
                 skipped_forbidden += 1
                 continue
+
+            # SEASON LOCK VALIDATION: Check (imdb_id, season) is valid
+            season_number = fp_row.get('season_number')
+            is_valid, validated_fc_uid, lock_reason = self._validate_season_lock(
+                fp_row.get('imdb_id'),
+                season_number,
+                fp_row.get('title', '')
+            )
+
+            if not is_valid:
+                skipped_season_lock += 1
+                self.stats['season_lock']['validations_failed'] += 1
+                self.stats['season_lock']['rejections'].append(lock_reason)
+                if skipped_season_lock <= 10:  # Only log first 10
+                    print(f"[LOCK REJECT] {fp_row.get('title')} - {lock_reason}")
+                continue
+
+            self.stats['season_lock']['validations_passed'] += 1
 
             # Find matching BFD row
             imdb_norm = fp_row.get('imdb_id_norm')
@@ -446,11 +539,13 @@ class GPUMergeEngine:
         self.stats['flixpatrol_rows_processed'] = processed
         self.stats['values_merged'] = merged
         self.stats['rows_skipped_forbidden_temporal'] = skipped_forbidden
+        self.stats['rows_skipped_season_lock'] = skipped_season_lock
 
         print(f"\n[RESULT] Processed: {processed:,} rows")
         print(f"[RESULT] Merged: {merged:,} values")
         print(f"[RESULT] Skipped (forbidden temporal): {skipped_forbidden:,}")
         print(f"[RESULT] Skipped (no column match): {skipped_no_match:,}")
+        print(f"[RESULT] Skipped (Season Lock rejected): {skipped_season_lock:,}")
 
         if self.stats['columns_requested_but_denied']:
             print(f"\n[AUTHORIZATION REQUIRED] The following columns were requested but do not exist:")
@@ -503,13 +598,17 @@ class GPUMergeEngine:
     def run(self):
         """Execute merge with strict schema enforcement."""
         print("=" * 70)
-        print("    INTELLIGENT MERGE ENGINE V27.00 - STRICT SCHEMA MODE")
+        print("    INTELLIGENT MERGE ENGINE V28.00 - STRICT SCHEMA MODE")
         print("    NO NEW COLUMNS WITHOUT AUTHORIZATION")
+        print("    SEASON LOCK ENABLED - Invalid seasons REJECTED")
         print("=" * 70)
         start_time = datetime.now()
 
         self.load_schema()
         self.load_base_database()
+
+        # Build Season Lock from reference data
+        self.build_season_lock()
 
         self.process_flixpatrol_views()
 
@@ -538,7 +637,20 @@ class GPUMergeEngine:
         print(f"  Rows processed: {self.stats['flixpatrol_rows_processed']:,}")
         print(f"  Values merged: {self.stats['values_merged']:,}")
         print(f"  Skipped (forbidden temporal): {self.stats['rows_skipped_forbidden_temporal']:,}")
+        print(f"  Skipped (Season Lock): {self.stats['rows_skipped_season_lock']:,}")
         print(f"  New columns created: 0 (ENFORCED)")
+
+        # Season Lock stats
+        if self.season_lock and self.season_lock.is_initialized():
+            lock_stats = self.stats['season_lock']
+            print(f"\nSeason Lock (Hardware Validation):")
+            print(f"  Validations passed: {lock_stats['validations_passed']:,}")
+            print(f"  Validations failed: {lock_stats['validations_failed']:,}")
+            print(f"  Total locks: {self.season_lock.stats['total_locks']:,}")
+            if lock_stats['rejections']:
+                print(f"  Recent rejections (last 5):")
+                for reason in lock_stats['rejections'][-5:]:
+                    print(f"    - {reason}")
 
         # Grep performance stats
         if self.column_grep:
